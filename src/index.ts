@@ -54,31 +54,41 @@ app.get("/api/weather/:city", async (req, res) => {
   }
 });
 
-app.get("/api/users", (_req, res) => {
-  res.json(listUsers());
+app.get("/api/users", async (_req, res) => {
+  try {
+    res.json(await listUsers());
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Error desconocido";
+    res.status(500).json({ error: message });
+  }
 });
 
-app.get("/api/users/search", (req, res) => {
+app.get("/api/users/search", async (req, res) => {
   const q = req.query.q as string | undefined;
   if (!q) {
     res.status(400).json({ error: "El parámetro 'q' es requerido" });
     return;
   }
-  res.json(searchUsers(q));
+  try {
+    res.json(await searchUsers(q));
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Error desconocido";
+    res.status(500).json({ error: message });
+  }
 });
 
-app.post("/api/users", (req, res) => {
+app.post("/api/users", async (req, res) => {
   const { name, email } = req.body;
   if (!name || !email) {
     res.status(400).json({ error: "name y email son requeridos" });
     return;
   }
   try {
-    const newUser = createUser(name, email);
+    const newUser = await createUser(name, email);
     res.status(201).json(newUser);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Error desconocido";
-    if (message.includes("UNIQUE")) {
+    if (message.includes("unique") || message.includes("UNIQUE") || message.includes("duplicate")) {
       res.status(409).json({ error: "El email ya está registrado" });
     } else {
       res.status(500).json({ error: message });
@@ -129,8 +139,8 @@ function createMcpServer() {
     "list_users",
     "Lista todos los usuarios registrados",
     {},
-    () => ({
-      content: [{ type: "text", text: JSON.stringify(listUsers(), null, 2) }],
+    async () => ({
+      content: [{ type: "text", text: JSON.stringify(await listUsers(), null, 2) }],
     })
   );
 
@@ -142,15 +152,15 @@ function createMcpServer() {
       name:  z.string().describe("Nombre completo"),
       email: z.string().email().describe("Email del usuario"),
     },
-    ({ name, email }) => {
+    async ({ name, email }) => {
       try {
-        const newUser = createUser(name, email);
+        const newUser = await createUser(name, email);
         return {
           content: [{ type: "text", text: `Usuario creado: ${JSON.stringify(newUser)}` }],
         };
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : "Error desconocido";
-        const text = message.includes("UNIQUE")
+        const text = message.includes("unique") || message.includes("duplicate")
           ? `Error: El email '${email}' ya está registrado`
           : `Error: ${message}`;
         return { content: [{ type: "text", text }] };
@@ -165,8 +175,8 @@ function createMcpServer() {
     {
       query: z.string().describe("Texto a buscar en nombre o email"),
     },
-    ({ query }) => ({
-      content: [{ type: "text", text: JSON.stringify(searchUsers(query), null, 2) }],
+    async ({ query }) => ({
+      content: [{ type: "text", text: JSON.stringify(await searchUsers(query), null, 2) }],
     })
   );
 
@@ -189,7 +199,8 @@ app.all("/mcp", async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MCP vía SSE → GET /mcp/sse  +  POST /mcp/messages
-// Alternativa para clientes que no soporten StreamableHTTP
+// Nota: en Vercel (serverless) SSE no funciona de forma fiable porque cada
+// request puede ir a una instancia distinta. Usar /mcp (StreamableHTTP).
 // ─────────────────────────────────────────────────────────────────────────────
 const sseConnections = new Map<string, SSEServerTransport>();
 
@@ -220,20 +231,24 @@ app.post("/mcp/messages", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// START
+// START — En Vercel se exporta el app; en local se levanta el servidor
 // ─────────────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 
-app.listen(PORT, () => {
-  console.log(`\nServidor corriendo en http://localhost:${PORT}`);
-  console.log(`\n── REST ──────────────────────────────────────────`);
-  console.log(`  GET  http://localhost:${PORT}/api/weather/:city`);
-  console.log(`  GET  http://localhost:${PORT}/api/users`);
-  console.log(`  GET  http://localhost:${PORT}/api/users/search?q=...`);
-  console.log(`  POST http://localhost:${PORT}/api/users`);
-  console.log(`\n── MCP ───────────────────────────────────────────`);
-  console.log(`  POST http://localhost:${PORT}/mcp         (StreamableHTTP)`);
-  console.log(`  GET  http://localhost:${PORT}/mcp/sse     (SSE - conectar)`);
-  console.log(`  POST http://localhost:${PORT}/mcp/messages (SSE - mensajes)`);
-  console.log(`\n`);
-});
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`\nServidor corriendo en http://localhost:${PORT}`);
+    console.log(`\n── REST ──────────────────────────────────────────`);
+    console.log(`  GET  http://localhost:${PORT}/api/weather/:city`);
+    console.log(`  GET  http://localhost:${PORT}/api/users`);
+    console.log(`  GET  http://localhost:${PORT}/api/users/search?q=...`);
+    console.log(`  POST http://localhost:${PORT}/api/users`);
+    console.log(`\n── MCP ───────────────────────────────────────────`);
+    console.log(`  POST http://localhost:${PORT}/mcp          (StreamableHTTP)`);
+    console.log(`  GET  http://localhost:${PORT}/mcp/sse      (SSE - conectar)`);
+    console.log(`  POST http://localhost:${PORT}/mcp/messages (SSE - mensajes)`);
+    console.log(`\n`);
+  });
+}
+
+export default app;
