@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
-import { listUsers, createUser, searchUsers } from "./db.js";
+import { listUsers, createUser, searchUsers, addExpense, listExpensesByUser, getExpenseSummaryByUser, deleteExpense } from "./db.js";
 
 const app = express();
 app.use(express.json());
@@ -96,6 +96,69 @@ app.post("/api/users", async (req, res) => {
   }
 });
 
+// ── Expenses ──────────────────────────────────────────────────────────────────
+
+app.post("/api/users/:userId/expenses", async (req, res) => {
+  const userId = parseInt(req.params.userId);
+  if (isNaN(userId)) { res.status(400).json({ error: "userId inválido" }); return; }
+
+  const { description, amount, category = "General", date } = req.body;
+  if (!description || amount === undefined) {
+    res.status(400).json({ error: "description y amount son requeridos" });
+    return;
+  }
+  if (typeof amount !== "number" || amount <= 0) {
+    res.status(400).json({ error: "amount debe ser un número mayor a 0" });
+    return;
+  }
+  try {
+    const expense = await addExpense(userId, description, amount, category, date);
+    res.status(201).json(expense);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Error desconocido";
+    if (message.includes("foreign key") || message.includes("violates")) {
+      res.status(404).json({ error: "Usuario no encontrado" });
+    } else {
+      res.status(500).json({ error: message });
+    }
+  }
+});
+
+app.get("/api/users/:userId/expenses", async (req, res) => {
+  const userId = parseInt(req.params.userId);
+  if (isNaN(userId)) { res.status(400).json({ error: "userId inválido" }); return; }
+  try {
+    res.json(await listExpensesByUser(userId));
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Error desconocido";
+    res.status(500).json({ error: message });
+  }
+});
+
+app.get("/api/users/:userId/expenses/summary", async (req, res) => {
+  const userId = parseInt(req.params.userId);
+  if (isNaN(userId)) { res.status(400).json({ error: "userId inválido" }); return; }
+  try {
+    res.json(await getExpenseSummaryByUser(userId));
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Error desconocido";
+    res.status(500).json({ error: message });
+  }
+});
+
+app.delete("/api/expenses/:id", async (req, res) => {
+  const id = parseInt(req.params.id);
+  if (isNaN(id)) { res.status(400).json({ error: "id inválido" }); return; }
+  try {
+    const deleted = await deleteExpense(id);
+    if (!deleted) { res.status(404).json({ error: "Gasto no encontrado" }); return; }
+    res.json({ message: "Gasto eliminado" });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Error desconocido";
+    res.status(500).json({ error: message });
+  }
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // MCP SERVER FACTORY
 // Cada conexión crea su propia instancia para evitar colisiones de estado
@@ -180,6 +243,85 @@ function createMcpServer() {
     })
   );
 
+  // Tool 5: Agregar gasto
+  server.tool(
+    "add_expense",
+    "Registra un nuevo gasto para un usuario",
+    {
+      user_id:     z.number().int().positive().describe("ID del usuario"),
+      description: z.string().describe("Descripción del gasto"),
+      amount:      z.number().positive().describe("Monto del gasto (mayor a 0)"),
+      category:    z.string().optional().default("General").describe("Categoría del gasto (ej: Comida, Transporte, Salud)"),
+      date:        z.string().optional().describe("Fecha del gasto en formato YYYY-MM-DD (por defecto hoy)"),
+    },
+    async ({ user_id, description, amount, category, date }) => {
+      try {
+        const expense = await addExpense(user_id, description, amount, category, date);
+        return { content: [{ type: "text", text: `Gasto registrado: ${JSON.stringify(expense, null, 2)}` }] };
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : "Error desconocido";
+        const text = message.includes("foreign key") || message.includes("violates")
+          ? `Error: El usuario con id ${user_id} no existe`
+          : `Error: ${message}`;
+        return { content: [{ type: "text", text }] };
+      }
+    }
+  );
+
+  // Tool 6: Listar gastos de un usuario
+  server.tool(
+    "list_expenses",
+    "Lista todos los gastos registrados de un usuario",
+    {
+      user_id: z.number().int().positive().describe("ID del usuario"),
+    },
+    async ({ user_id }) => {
+      const expenses = await listExpensesByUser(user_id);
+      const text = expenses.length === 0
+        ? `El usuario ${user_id} no tiene gastos registrados.`
+        : JSON.stringify(expenses, null, 2);
+      return { content: [{ type: "text", text }] };
+    }
+  );
+
+  // Tool 7: Resumen de gastos por categoría
+  server.tool(
+    "get_expense_summary",
+    "Muestra el resumen de gastos agrupados por categoría para un usuario",
+    {
+      user_id: z.number().int().positive().describe("ID del usuario"),
+    },
+    async ({ user_id }) => {
+      const summary = await getExpenseSummaryByUser(user_id);
+      if (summary.length === 0) {
+        return { content: [{ type: "text", text: `El usuario ${user_id} no tiene gastos registrados.` }] };
+      }
+      const total = summary.reduce((acc, s) => acc + s.total, 0);
+      const lines = [
+        `Resumen de gastos — usuario #${user_id}`,
+        "─".repeat(40),
+        ...summary.map(s => `  ${s.category.padEnd(20)} ${s.count} gastos   $${s.total.toFixed(2)}`),
+        "─".repeat(40),
+        `  ${"TOTAL".padEnd(20)}              $${total.toFixed(2)}`,
+      ];
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    }
+  );
+
+  // Tool 8: Eliminar gasto
+  server.tool(
+    "delete_expense",
+    "Elimina un gasto por su ID",
+    {
+      id: z.number().int().positive().describe("ID del gasto a eliminar"),
+    },
+    async ({ id }) => {
+      const deleted = await deleteExpense(id);
+      const text = deleted ? `Gasto #${id} eliminado correctamente.` : `Error: Gasto #${id} no encontrado.`;
+      return { content: [{ type: "text", text }] };
+    }
+  );
+
   return server;
 }
 
@@ -239,10 +381,14 @@ if (!process.env.VERCEL) {
   app.listen(PORT, () => {
     console.log(`\nServidor corriendo en http://localhost:${PORT}`);
     console.log(`\n── REST ──────────────────────────────────────────`);
-    console.log(`  GET  http://localhost:${PORT}/api/weather/:city`);
-    console.log(`  GET  http://localhost:${PORT}/api/users`);
-    console.log(`  GET  http://localhost:${PORT}/api/users/search?q=...`);
-    console.log(`  POST http://localhost:${PORT}/api/users`);
+    console.log(`  GET    http://localhost:${PORT}/api/weather/:city`);
+    console.log(`  GET    http://localhost:${PORT}/api/users`);
+    console.log(`  GET    http://localhost:${PORT}/api/users/search?q=...`);
+    console.log(`  POST   http://localhost:${PORT}/api/users`);
+    console.log(`  POST   http://localhost:${PORT}/api/users/:userId/expenses`);
+    console.log(`  GET    http://localhost:${PORT}/api/users/:userId/expenses`);
+    console.log(`  GET    http://localhost:${PORT}/api/users/:userId/expenses/summary`);
+    console.log(`  DELETE http://localhost:${PORT}/api/expenses/:id`);
     console.log(`\n── MCP ───────────────────────────────────────────`);
     console.log(`  POST http://localhost:${PORT}/mcp          (StreamableHTTP)`);
     console.log(`  GET  http://localhost:${PORT}/mcp/sse      (SSE - conectar)`);
